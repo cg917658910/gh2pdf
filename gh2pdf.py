@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime
+from xml.sax.saxutils import escape
 from pathlib import Path
 
 
@@ -110,7 +111,73 @@ def collect_files(root: Path, include_exts: set[str], exclude_dirs: set[str], ma
     return files
 
 
-def generate_pdf(output_path: Path, repo_root: Path, files: list[Path], tree_text: str, source_label: str):
+def _token_color(style, token_type):
+    try:
+        style_def = style.style_for_token(token_type)
+    except KeyError:
+        parent = token_type.parent
+        style_def = {}
+        while parent is not None:
+            try:
+                style_def = style.style_for_token(parent)
+                break
+            except KeyError:
+                parent = parent.parent
+    return style_def.get("color")
+
+
+def build_code_lines(text: str, filename: str, highlight: bool) -> list[str]:
+    if not highlight:
+        return [escape(line) for line in text.split("\n")]
+
+    try:
+        from pygments import lex
+        from pygments.lexers import get_lexer_for_filename, TextLexer
+        from pygments.styles import get_style_by_name
+    except ImportError:
+        return [escape(line) for line in text.split("\n")]
+
+    try:
+        lexer = get_lexer_for_filename(filename, text)
+    except Exception:
+        lexer = TextLexer()
+
+    style = get_style_by_name("default")
+    lines = [""]
+    for token_type, value in lex(text, lexer):
+        if not value:
+            continue
+        color = _token_color(style, token_type)
+        parts = value.split("\n")
+        for idx, part in enumerate(parts):
+            if part:
+                escaped = escape(part)
+                if color:
+                    lines[-1] += f'<font color="#{color}">{escaped}</font>'
+                else:
+                    lines[-1] += escaped
+            if idx < len(parts) - 1:
+                lines.append("")
+    return lines
+
+
+def add_line_numbers(lines: list[str]) -> list[str]:
+    width = len(str(len(lines)))
+    numbered = []
+    for idx, line in enumerate(lines, start=1):
+        numbered.append(f"{idx:>{width}}  {line}")
+    return numbered
+
+
+def generate_pdf(
+    output_path: Path,
+    repo_root: Path,
+    files: list[Path],
+    tree_text: str,
+    source_label: str,
+    highlight: bool,
+    show_line_numbers: bool,
+):
     try:
         from reportlab.lib import pagesizes
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
@@ -123,6 +190,7 @@ def generate_pdf(output_path: Path, repo_root: Path, files: list[Path], tree_tex
             Preformatted,
             Spacer,
             PageBreak,
+            XPreformatted,
         )
         from reportlab.platypus.tableofcontents import TableOfContents
     except ImportError as exc:
@@ -134,12 +202,29 @@ def generate_pdf(output_path: Path, repo_root: Path, files: list[Path], tree_tex
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self._heading_count = 0
+            self._last_outline_level = -1
 
         def afterFlowable(self, flowable):
-            if hasattr(flowable, "style") and flowable.style.name == "Heading1":
-                self._heading_count += 1
-                text = flowable.getPlainText()
-                self.notify("TOCEntry", (0, text, self.page))
+            if not hasattr(flowable, "style"):
+                return
+            level_map = {
+                "Heading1": 0,
+                "Heading2": 1,
+                "Heading3": 2,
+            }
+            level = level_map.get(flowable.style.name)
+            if level is None:
+                return
+            text = flowable.getPlainText()
+            self._heading_count += 1
+            if level > self._last_outline_level + 1:
+                level = self._last_outline_level + 1
+            bookmark_key = f"h{level}_{self._heading_count}"
+            # Create PDF outline entry (clickable in most PDF readers).
+            self.canv.bookmarkPage(bookmark_key)
+            self.canv.addOutlineEntry(text, bookmark_key, level=level, closed=False)
+            self.notify("TOCEntry", (level, text, self.page))
+            self._last_outline_level = level
 
     def on_page(canvas, doc):
         canvas.saveState()
@@ -154,10 +239,19 @@ def generate_pdf(output_path: Path, repo_root: Path, files: list[Path], tree_tex
     styles = getSampleStyleSheet()
     if "CodeBlock" not in styles:
         styles.add(
-            ParagraphStyle(name="CodeBlock", fontName="Courier", fontSize=8, leading=10)
+            ParagraphStyle(
+                name="CodeBlock",
+                fontName="Courier",
+                fontSize=9,
+                leading=12,
+            )
         )
     if "Heading1" not in styles:
-        styles.add(ParagraphStyle(name="Heading1", fontSize=14, leading=16, spaceAfter=8))
+        styles.add(ParagraphStyle(name="Heading1", fontSize=16, leading=18, spaceAfter=10))
+    if "Heading2" not in styles:
+        styles.add(ParagraphStyle(name="Heading2", fontSize=13, leading=15, spaceAfter=8))
+    if "Heading3" not in styles:
+        styles.add(ParagraphStyle(name="Heading3", fontSize=11, leading=13, spaceAfter=6))
 
     doc = TOCDocTemplate(
         str(output_path),
@@ -199,20 +293,60 @@ def generate_pdf(output_path: Path, repo_root: Path, files: list[Path], tree_tex
             firstLineIndent=-20,
             spaceBefore=5,
             leading=12,
-        )
+        ),
+        ParagraphStyle(
+            fontName="Helvetica",
+            name="TOCLevel1",
+            fontSize=9,
+            leftIndent=35,
+            firstLineIndent=-20,
+            spaceBefore=3,
+            leading=11,
+        ),
+        ParagraphStyle(
+            fontName="Helvetica",
+            name="TOCLevel2",
+            fontSize=9,
+            leftIndent=50,
+            firstLineIndent=-20,
+            spaceBefore=2,
+            leading=10,
+        ),
     ]
     story.append(Paragraph("Table of Contents", styles["Heading1"]))
     story.append(toc)
     story.append(PageBreak())
 
+    current_dir_parts = []
     for path in files:
         rel = path.relative_to(repo_root)
-        story.append(Paragraph(str(rel), styles["Heading1"]))
+        dir_parts = list(rel.parts[:-1])
+        for idx, part in enumerate(dir_parts):
+            if len(current_dir_parts) > idx and current_dir_parts[idx] == part:
+                continue
+            current_dir_parts = dir_parts[: idx + 1]
+            heading_text = "/".join(current_dir_parts)
+            style_name = "Heading1" if idx == 0 else "Heading2"
+            story.append(Paragraph(heading_text, styles[style_name]))
+
+        if len(dir_parts) >= 2:
+            file_heading_style = "Heading3"
+        else:
+            file_heading_style = "Heading2"
+        story.append(Paragraph(str(rel), styles[file_heading_style]))
         try:
             text = path.read_text(errors="replace")
         except OSError:
             text = "[Error reading file]"
-        story.append(Preformatted(text, styles["CodeBlock"]))
+        text = text.replace("\t", "    ")
+        lines = build_code_lines(text, str(path), highlight=highlight)
+        if show_line_numbers:
+            lines = add_line_numbers(lines)
+        joined = "\n".join(lines)
+        if highlight:
+            story.append(XPreformatted(joined, styles["CodeBlock"]))
+        else:
+            story.append(Preformatted(joined, styles["CodeBlock"]))
         story.append(PageBreak())
 
     doc.build(story)
@@ -243,6 +377,16 @@ def parse_args(argv):
         default=512,
         help="Skip files larger than this size (KB)",
     )
+    parser.add_argument(
+        "--no-highlight",
+        action="store_true",
+        help="Disable syntax highlighting",
+    )
+    parser.add_argument(
+        "--no-line-numbers",
+        action="store_true",
+        help="Disable line numbers",
+    )
     return parser.parse_args(argv)
 
 
@@ -272,7 +416,15 @@ def main(argv=None):
             raise RuntimeError("No files found with the selected extensions.")
 
         output_path = Path(args.output).expanduser().resolve()
-        generate_pdf(output_path, repo_root, files, tree_text, source_label)
+        generate_pdf(
+            output_path,
+            repo_root,
+            files,
+            tree_text,
+            source_label,
+            highlight=not args.no_highlight,
+            show_line_numbers=not args.no_line_numbers,
+        )
         print(f"PDF created: {output_path}")
 
     finally:
